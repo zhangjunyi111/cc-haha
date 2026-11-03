@@ -710,3 +710,385 @@ desktop client protocol → real server → real CLI → loopback Anthropic endp
 5. 内核来源带来的授权问题不属于技术范畴，但会直接决定能否商用。
 
 **适合的用法**：学习 Agent 系统实现、研究桌面端与 CLI 的进程/协议分层、个人自用。不适合作为需要长期合规维护的商业基础。
+
+---
+
+## 附录 A：架构与流程图示
+
+> 图中的 `file:line` 与正文一致。Mermaid 由 GitHub 原生渲染。
+
+### A.1 进程与模块总览
+
+```mermaid
+flowchart TB
+  subgraph Host["Electron 主进程"]
+    EM["desktop/electron/main.ts"]
+    RS["React Renderer<br/>desktop/src"]
+  end
+
+  subgraph Sidecars["Bun Sidecars"]
+    SV["claude-sidecar server<br/>src/server/index.ts"]
+    AD["claude-sidecar adapters<br/>adapters/*"]
+  end
+
+  subgraph Kernel["CLI 内核（每会话一个子进程）"]
+    CLI["src/entrypoints/cli.tsx"]
+    LOOP["query.ts / QueryEngine.ts"]
+    TOOLS["src/tools/*"]
+    PROV["services/api/claude.ts"]
+  end
+
+  subgraph Outside["外部"]
+    LLM["模型服务<br/>Anthropic / OpenAI / Gemini"]
+    IM["IM 平台"]
+    MOB["手机 App / H5"]
+  end
+
+  EM --> SV
+  EM --> RS
+  RS <-->|"/ws/:sessionId"| SV
+  MOB <-->|"/ws 或 /api"| SV
+  IM <--> AD
+  AD <-->|"WS bridge"| SV
+  SV <-->|"/sdk/:sessionId"| CLI
+  CLI --> LOOP
+  LOOP <--> TOOLS
+  LOOP <--> PROV
+  PROV <--> LLM
+```
+
+### A.2 CLI 启动时序
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as 用户
+  participant BIN as bin/claude-haha
+  participant EP as entrypoints/cli.tsx
+  participant MAIN as main.tsx
+  participant SETUP as setup.ts
+  participant REPL as screens/REPL.tsx
+  participant Q as query.ts
+  participant API as services/api/claude.ts
+
+  U->>BIN: 启动
+  BIN->>BIN: 解析 CALLER_DIR / feature flag
+  BIN->>EP: Bun.spawn(--feature=TRANSCRIPT_CLASSIFIER)
+  EP->>MAIN: 解析 CLI 参数
+  MAIN->>SETUP: setup()
+  SETUP-->>MAIN: 配置、认证、工具注册
+  MAIN->>REPL: launchRepl()
+  U->>REPL: 输入消息
+  REPL->>Q: onQuery() → queryLoop()
+  Q->>API: callModel()
+  API-->>Q: 流式 assistant / tool_use
+  Q-->>REPL: 工具栏、差分、结果
+```
+
+### A.3 单轮 Agent 主循环
+
+```mermaid
+flowchart TD
+  S["用户消息"] --> G["QueryGuard.tryStart"]
+  G --> PF["预算 / 压缩检查"]
+  PF -->|"超阈值"| C["autoCompact / microcompact"]
+  C --> PF
+  PF --> CM["callModel 流式请求"]
+  CM --> ST{"流是否正常"}
+  ST -->|"中断 / 可重放"| RT["withRetry / withStreamRetry"]
+  RT --> CM
+  ST -->|"成功"| TB{"存在 tool_use?"}
+  TB -->|"是"| OR["工具编排"]
+  OR --> CC{"isConcurrencySafe?"}
+  CC -->|"连续安全"| PAR["并发批（默认上限 10）"]
+  CC -->|"非安全"| SER["串行独占"]
+  PAR --> PR{"权限判定"}
+  SER --> PR
+  PR -->|"deny"| ERR["生成 tool_result 错误"]
+  PR -->|"allow / ask 通过"| EX["执行工具"]
+  EX --> AR["附件 + 队列"]
+  ERR --> AR
+  AR --> NX["state = next"]
+  NX --> PF
+  TB -->|"否"| SH["stop hooks"]
+  SH --> END["返回"]
+```
+
+### A.4 一次工具调用的权限时序
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant L as queryLoop
+  participant TE as toolExecution
+  participant HK as Hooks
+  participant PM as permissions.ts
+  participant UI as PermissionRequest
+  participant TL as 工具 call()
+
+  L->>TE: 执行 tool_use
+  TE->>HK: PreToolUse
+  HK-->>TE: allow / deny / ask / 修改 input
+  TE->>PM: resolve 权限
+  PM->>PM: 1a deny → 1c checkPermissions → 2b allow → 3 ask
+  alt 规则 allow
+    PM-->>TE: allow
+  else 需要询问
+    PM->>UI: ToolUseConfirm
+    UI-->>PM: onAllow / onReject / onAbort
+    alt abort 或流关闭
+      PM-->>TE: deny
+    end
+  end
+  TE->>TL: call()
+  TL-->>TE: ToolResult
+  TE->>HK: PostToolUse
+```
+
+### A.5 自动压缩决策
+
+```mermaid
+flowchart TD
+  A["每轮请求前"] --> B{"估算 token > 阈值?"}
+  B -->|"否"| Z["继续请求"]
+  B -->|"是"| C["尝试 session memory 压缩"]
+  C -->|"成功"| D["buildPostCompactMessages"]
+  C -->|"失败"| E["compactConversation（LLM 摘要）"]
+  E -->|"成功"| D
+  E -->|"失败"| F{"连续失败 ≥ 3?"}
+  F -->|"否"| G["回退 / 重试"]
+  F -->|"是"| H["熔断并上抛"]
+  D --> I["重置 tracking，仅保留 boundary 后消息"]
+  I --> Z
+```
+
+### A.6 Server ↔ CLI 桥接时序
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant R as Renderer / H5
+  participant H as server/ws/handler
+  participant C as CLI RemoteIO
+  participant Q as queryLoop
+  participant P as server/proxy
+  participant M as 模型服务
+
+  R->>H: user_message（WS /ws/:id）
+  H->>C: 会话消息（WS /sdk/:id）
+  C->>Q: 构造用户消息
+  Q->>P: Anthropic Beta Messages 请求
+  P->>M: 转换后的上游请求
+  M-->>P: SSE 流
+  P-->>Q: Anthropic 流事件
+  Q-->>C: assistant / tool / permission 事件
+  C->>H: HTTP POST 上行（stream_event 100ms 合批）
+  H-->>R: 事件推送
+  R->>H: permission_response
+  H->>C: control_response 下行
+```
+
+说明：CLI 侧 `HybridTransport` 的语义是**读走 WebSocket、写走 HTTP POST**；不要把它理解成纯 WS 双向。
+
+### A.7 子 Agent spawn 时序
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant PA as 父 Agent
+  participant AT as AgentTool
+  participant LD as loadAgentsDir
+  participant TP as assembleToolPool
+  participant RA as runAgent
+  participant Q as 子 queryLoop
+  participant TK as Task / LocalAgentTask
+
+  PA->>AT: Agent(prompt, subagent_type)
+  AT->>LD: 解析定义与来源优先级
+  LD-->>AT: AgentDefinition
+  AT->>TP: 按子权限模式裁剪工具池
+  alt 同步执行
+    AT->>RA: runAgent()
+    RA->>Q: queryLoop()
+    Q-->>RA: 最终结果
+    RA-->>PA: 返回
+  else 异步执行
+    AT->>TK: registerAsyncAgent()
+    TK-->>PA: taskId
+    Q-->>TK: 进度 / 完成
+    TK-->>PA: task-notification
+  end
+```
+
+### A.8 模块分层与依赖方向
+
+```mermaid
+flowchart TB
+  subgraph Entry["入口层"]
+    E1["entrypoints/cli.tsx"]
+    E2["main.tsx / screens/REPL.tsx"]
+    E3["QueryEngine.ts"]
+  end
+
+  subgraph Core["核心执行层"]
+    C1["query.ts"]
+    C2["Tool.ts / tools.ts"]
+    C3["services/api"]
+    C4["services/compact"]
+  end
+
+  subgraph Support["支撑层"]
+    S1["utils/permissions"]
+    S2["utils/messages / sessionStorage"]
+    S3["services/mcp"]
+    S4["utils/hooks"]
+  end
+
+  subgraph Server["服务层"]
+    V1["server/index.ts"]
+    V2["server/ws/handler.ts"]
+    V3["server/proxy"]
+    V4["server/services"]
+  end
+
+  E1 --> E2 --> C1
+  E3 --> C1
+  C1 --> C2
+  C1 --> C3
+  C1 --> C4
+  C2 --> S1
+  C2 --> S3
+  C1 --> S2
+  C1 --> S4
+  V1 --> V2
+  V1 --> V3
+  V1 --> V4
+  V4 --> C1
+```
+
+### A.9 类继承与协议实现关系
+
+传输层（这是内核里少见的真实 OOP 继承）：
+
+```mermaid
+classDiagram
+  class Transport {
+    <<interface>>
+    +write(message)
+    +close()
+  }
+  class StructuredIO {
+    +write(message)
+    +flushInternalEvents()
+  }
+  class RemoteIO {
+    +write(message)
+    +flushInternalEvents()
+    +internalEventsPending
+  }
+  class WebSocketTransport {
+    +write(message)
+  }
+  class HybridTransport {
+    +write(message)
+  }
+  class SSETransport {
+    +write(message)
+  }
+
+  StructuredIO <|-- RemoteIO
+  Transport <|.. WebSocketTransport
+  Transport <|.. SSETransport
+  WebSocketTransport <|-- HybridTransport
+```
+
+> 注意：`src/cli/transports/Transport.ts` 在此构建中是自动生成的 stub；`Transport` 只作为类型使用，运行时被擦除。
+
+Ink 事件层：
+
+```mermaid
+classDiagram
+  class Event
+  class TerminalEvent
+  class TerminalFocusEvent
+  class FocusEvent
+  class KeyboardEvent
+  class ClickEvent
+  class InputEvent
+
+  Event <|-- TerminalEvent
+  TerminalEvent <|-- TerminalFocusEvent
+  TerminalEvent <|-- FocusEvent
+  TerminalEvent <|-- KeyboardEvent
+  Event <|-- ClickEvent
+  Event <|-- InputEvent
+```
+
+工具层不是类继承，而是**结构化类型 + 工厂默认值**：
+
+```mermaid
+classDiagram
+  class Tool {
+    <<type>>
+    +call()
+    +description()
+    +inputSchema
+    +isConcurrencySafe()
+    +checkPermissions()
+  }
+  class buildTool {
+    +applyDefaults()
+  }
+  class BashTool
+  class FileEditTool
+  class AgentTool
+  class MCPTool
+
+  buildTool ..> Tool : 生成
+  Tool <|.. BashTool : 结构实现
+  Tool <|.. FileEditTool : 结构实现
+  Tool <|.. AgentTool : 结构实现
+  Tool <|.. MCPTool : 模板展开
+```
+
+`buildTool` 的默认值正是风险来源：`isConcurrencySafe` / `isReadOnly` 默认 `false`（失败安全），但 `checkPermissions` 默认 `allow`（失败开放）。
+
+### A.10 后台任务状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending
+  pending --> running
+  running --> paused
+  paused --> running
+  running --> completed
+  running --> failed
+  running --> killed
+  paused --> killed
+  completed --> [*]
+  failed --> [*]
+  killed --> [*]
+```
+
+只有 `terminal + notified` 的任务可以被 GC（`utils/task/framework.ts:48-143,184-295`）。
+
+### A.11 Agent Teams 消息流
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant TL as Team Lead
+  participant SM as SendMessageTool
+  participant MB as mailbox 文件
+  participant WM as 成员（in-process / tmux）
+
+  TL->>SM: SendMessage(to, message)
+  SM->>MB: writeToMailbox（加锁）
+  WM->>MB: 每 500ms 轮询 claimMailboxMessages
+  MB-->>WM: 原子领取消息
+  WM->>MB: 写入回复
+  TL->>MB: 轮询
+  MB-->>TL: 成员回复 / shutdown_response
+```
+
+风险点：sender 只是一个 `from` 字符串，没有认证；任何能写 `~/.claude/teams` 的本地进程都能伪造消息或成员。
