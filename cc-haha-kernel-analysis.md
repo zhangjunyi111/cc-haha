@@ -1092,3 +1092,207 @@ sequenceDiagram
 ```
 
 风险点：sender 只是一个 `from` 字符串，没有认证；任何能写 `~/.claude/teams` 的本地进程都能伪造消息或成员。
+
+---
+
+## 附录 B：多 Agent 协作的具体实现
+
+### B.1 三种形态
+
+| 形态 | 生命周期 | 通信方式 | 典型入口 |
+|---|---|---|---|
+| 子 Agent（subagent） | 一次任务，可后台 | 返回值 / `SendMessage` 追加消息 | `Agent({ subagent_type })` |
+| Agent Teams | 常驻，跨多轮 | 文件 mailbox + 500ms 轮询 | `TeamCreate` + `Agent({ team_name, name })` |
+| Workflow | 一次编排运行 | `agent()` / `parallel()` / `pipeline()` | `WorkflowTool` |
+
+三者共用同一个 Agent 循环：`runAgent()` 内部调用 `query()`。区别只在**谁负责创建、谁负责给下一轮输入、结果怎么回去**。
+
+### B.2 子 Agent 的 spawn
+
+`AgentTool` 的输入（`src/tools/AgentTool/AgentTool.tsx:91-106`）：
+
+```ts
+subagent_type?: string
+run_in_background?: boolean
+name?: string          // 可被 SendMessage 寻址
+team_name?: string     // 有值且同时给 name → 走 Teams spawn
+isolation?: 'worktree' | 'remote'
+cwd?: string
+model?: string
+```
+
+执行顺序：
+
+1. **解析定义**：`loadAgentsDir` 扫描 `~/.claude/agents`、项目 `.claude/agents`、插件、内置、CLI `--agents`、托管策略；同名按 `built-in < plugin < user < project < flag < policy` 选最高优先级（`loadAgentsDir.ts:212-246`）。
+2. **裁剪工具池**：用子 Agent 自己的 `permissionMode` 重新 `assembleToolPool`，不复用父池（`AgentTool.tsx:610-615`）；`agentToolUtils.ts:72-118` 过滤掉 Agent/编辑类等禁用工具。fork 模式例外，用 `useExactTools` 复用父池以保 prompt cache（`:656-679`）。
+3. **解析模型/effort**：`getAgentModel` → `SUBAGENT_MODEL` / `inherit` / 同层别名；effort 缺省继承父会话（`runAgent.ts:637-653`）。
+4. **上下文**：
+   - 普通子 Agent 只收到新的 user message（`runAgent.ts:574-576`）。
+   - fork 子 Agent 继承父 messages + 父 system prompt，并把未完成的 tool call 过滤掉（`:516-548`）。
+5. **执行**：同步走 `runAgent()`；异步走 `registerAsyncAgent()` + `runAsyncAgentLifecycle()`，注册成 `local_agent` 任务，前台任务超过 120 秒自动转后台（`LocalAgentTask.tsx:590-681`）。
+6. **结果回传**：同步直接返回；异步通过 `<task-notification>` XML 通知，先去重（原子置 `notified`）再入队（`LocalAgentTask.tsx:234-302`）。
+7. **worktree 隔离**：创建临时 worktree，无改动则删、有改动保留并把路径写进 metadata 供 resume（`AgentTool.tsx:634-740`；`worktree.ts:1084-1148`）。
+
+### B.3 Teams 的存储与身份
+
+`TeamCreate` 在 `~/.claude/teams/<team>/config.json` 写入（`teamHelpers.ts:78-115`）：
+
+```json
+{
+  "name": "feature-team",
+  "leadAgentId": "...",
+  "leadSessionId": "...",
+  "reviewRequired": false,
+  "members": [
+    {
+      "agentId": "...",
+      "name": "frontend-dev",
+      "agentType": "general-purpose",
+      "model": "sonnet",
+      "tmuxPaneId": "%3",
+      "cwd": "/repo",
+      "subscriptions": [],
+      "backendType": "tmux",
+      "joinedAt": 1760000000000
+    }
+  ]
+}
+```
+
+关键约束（都是代码里写死的）：
+
+- **roster 是扁平数组**。teammate 不能再 spawn teammate（`AgentTool.tsx:277-281`），否则成员没有 provenance。
+- **in-process teammate 不能 spawn 后台 Agent**（`:282-287`），因为生命周期绑在 leader 进程上。
+- 团队还有一份共享任务目录 `~/.claude/tasks/<team>/`，成员可以领取任务。
+- `TeamCreate` 支持传 `plan`：先存成 draft，等人工在桌面端 review 通过才真正启动成员（`teamPlanStore.ts`、`teamPlanPolicy.ts`）。
+
+### B.4 消息协议：邮箱文件
+
+每个成员一个 inbox（`teammateMailbox.ts:87-132`）：
+
+```text
+~/.claude/teams/<team>/inboxes/<agent>.json          # 只存未读
+~/.claude/teams/<team>/inboxes/<agent>.history.jsonl # 追加式历史
+```
+
+消息结构：
+
+```ts
+type TeammateMessage = {
+  id: string
+  from: string        // 只是一个名字字符串，没有签名
+  text: string
+  timestamp: string
+  read: boolean
+  color?: string
+  summary?: string
+}
+```
+
+写入 `writeToMailbox`（`:454-492`）：
+
+1. `ensureInboxDir`。
+2. 文件不存在则以 `wx` 创建空数组。
+3. `updateInbox` 在 `proper-lockfile` 锁内追加。
+4. 锁参数：30 次重试、5–100ms 退避，总预算约 2.6 秒（`:69-82`）。
+5. 锁竞争失败返回 `false`，**消息会丢**——调用方只记录日志，没有重试队列。
+
+读取用 `claimMailboxMessages`（`:504-541`）：
+
+- 先读未读，再在锁内按 `id/from/timestamp` 身份匹配，把命中的置为 `read`，返回本次真正领取到的子集。
+- 两个消费者并发读同一个 inbox，不会同时领到同一条消息。
+- 读取后把已读条目移入 `.history.jsonl`，live inbox 只保留未读。
+
+`SendMessage` 的路由（`SendMessageTool.ts`）：
+
+| `to` | 行为 |
+|---|---|
+| 成员名 | `writeToMailbox` |
+| `*` | 遍历 `team.members` 逐个写（不是原子广播） |
+| 普通子 Agent | `queuePendingMessage` 到 `LocalAgentTask` |
+| 结构化消息 | `shutdown_request` / `shutdown_response` / `plan_approval_response` |
+
+### B.5 in-process 执行循环
+
+`runInProcessTeammate`（`inProcessRunner.ts:1257`）是一个常驻循环：
+
+```text
+初始化身份、context、transcript
+  ↓
+currentPrompt = 初始 prompt（包成 <teammate-message>）
+  ↓
+while (!shouldExit)
+  ├─ runAgent({ promptMessages: currentPrompt, forkContextMessages: allMessages, ... })
+  │    └─ 内部就是 query()，与普通子 Agent 完全同一条循环
+  ├─ 收集本轮消息，更新 task 状态/进度
+  ├─ waitForNextPromptOrShutdown()   ← 轮询
+  └─ 根据 WaitResult 生成下一轮 currentPrompt
+```
+
+`waitForNextPromptOrShutdown`（`:1051-1166`）每 **500ms** 轮询，优先级固定：
+
+1. **UI 注入的 pending user message**（`task.pendingUserMessages`）——最高优先。
+2. **mailbox**：shutdown 请求单独优先返回，保证不会被其他消息饿死（`:987-1006`）。
+3. **团队任务列表**：`claimNextInProcessTask` 领取未认领任务（`:1145-1155`）。
+4. deadline / cancel 信号。
+
+投递规则（`takeTeammateMailbox:978-1037`）：
+
+- 一次把当前所有可投递消息**合并成一个 prompt**，每条各自包一层 `<teammate-message from="...">`。
+- 协议帧（shutdown/plan approval 等）不会变成自然语言给模型，只有 lead 发来的 plan approval 例外。
+- 投递前先 claim；claim 失败则这一轮不投递，下一轮再试。
+
+**崩溃窗口**：claim 是“先标记已读再返回”，如果进程在 claim 之后、消息真正进入模型之前崩溃，这条消息不会重投。这是 at-most-once 语义。
+
+### B.6 后端切换
+
+`registry.ts:351-389` + `detectAndGetBackend:136-254`：
+
+```text
+-p / 非交互          → in-process（强制）
+终端里已有 tmux      → 在当前窗口 split pane
+iTerm2 + it2 可用    → iTerm2 pane
+其他                 → in-process
+spawn 失败           → 回退 in-process
+```
+
+- **in-process**：同进程，`AsyncLocalStorage` 隔离上下文，共享 API client / MCP 连接；用 `AbortController` 终止。
+- **tmux / iTerm2**：独立进程，通过 CLI flag 继承 permission / model / effort / env；用 pane id 管理生命周期。
+- 两条路径都使用**同一套文件 mailbox**，所以跨后端可以混用。
+
+### B.7 权限协作
+
+- **in-process teammate**：通过模块级 bridge 使用 leader REPL 的 `ToolUseConfirm` 队列（`leaderPermissionBridge.ts:1-50`）。`createInProcessCanUseTool`（`inProcessRunner.ts:188-240`）先跑通用权限判定，Bash 再尝试分类器自动放行，仍未决才弹 leader 的权限框。
+- **tmux teammate**：权限请求经 `permissionSync` / `useSwarmPermissionPoller` 同步给 lead，由 lead 的 UI 处理。
+- 因此 in-process 成员可以弹窗，真正的后台子 Agent 不能——这是代码注释里明确写出的差异（`inProcessRunner.ts:1604-1606`）。
+
+### B.8 关停
+
+```text
+Lead: SendMessage({ to: "frontend-dev", message: { type: "shutdown_request" }})
+  → 成员模型看到请求，自行决定
+  → SendMessage({ type: "shutdown_response", approve: true/false })
+  → Lead 收到 approval 后从 roster 摘除
+  → TeamDelete（仍有非 lead 成员会拒绝）
+```
+
+in-process 成员 approval 后走 `abort`；pane 成员走 `gracefulShutdown` 再关 pane。
+
+### B.9 Workflow 是另一条路径
+
+Workflow 不走 mailbox：
+
+- 模型生成一段 JS，运行时是 `node:vm` 沙箱（无原型、禁 `codeGeneration`、禁 import、`Date.now`/`Math.random` 抛错）。
+- 提供 host 函数 `agent()` / `parallel()` / `pipeline()`，子 Agent 固定 `acceptEdits`。
+- 用 journal 记录每个 step 的 started/result，支持断点续跑；第一个 cache miss 后全部重跑。
+- 资源上限：1000 agents、4096 fanout、30s sync timeout、token budget 硬闸。
+
+### B.10 实现上的局限
+
+1. **没有认证**：`from` 是自报字符串；能写 `~/.claude/teams` 的本地进程可以伪造任意成员消息或关机批准（`attachments.ts:3871-3923`）。
+2. **文件轮询延迟**：成员空闲时最坏 500ms 才能收到消息；广播是 N 次独立写入，不是原子操作。
+3. **锁竞争会丢消息**：`writeToMailbox` 超过 2.6 秒仍拿不到锁就返回 `false`，调用方不重试。
+4. **投递 at-most-once**：claim 后崩溃会丢消息。
+5. **in-process 共享事件循环**：一个成员的长同步任务会阻塞同进程的其他成员；pane 后端没有这个问题。
+6. **扁平 roster**：不支持嵌套团队；`TeamFile.members` 没有 parent 关系，硬性禁止 teammate 再 spawn teammate。
+7. **状态分散**：团队状态在 `config.json`、inbox、history、task list、transcript 五处，任何一处损坏都可能导致成员“失联”。
