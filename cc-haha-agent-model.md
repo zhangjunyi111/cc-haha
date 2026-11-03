@@ -373,3 +373,107 @@ cc-haha 桌面端       --  同一套 /sdk 协议                          -->  
 > 代码里没有 `Agent` 类。**定义**是 `AgentDefinition`（数据），**工具**是 `AgentTool`（有 `call()`），**身份**是 `AgentContext`（AsyncLocalStorage），**执行**是 `runAgent()`（async generator），**运行时状态**是 `ToolUseContext`，**对外协议**是 `AgentInfo`。
 
 在 Markdown 里定义一个 Agent 时，你写的 frontmatter 最终会变成 `AgentDefinition`；模型调用 `Agent({...})` 时，`AgentTool.call()` 解析它，然后交给 `runAgent()` 执行。
+
+---
+
+## 11. `PLAN_AGENT` 是什么
+
+`PLAN_AGENT` 是内置 **Plan 子代理的定义对象**，不是类，也不是权限模式。
+
+定义位置：`src/tools/AgentTool/built-in/planAgent.ts:73-92`
+
+```ts
+export const PLAN_AGENT: BuiltInAgentDefinition = {
+  agentType: 'Plan',
+  whenToUse: 'Software architect agent for designing implementation plans...',
+  disallowedTools: [
+    AGENT_TOOL_NAME,          // 不能再生子 Agent
+    EXIT_PLAN_MODE_TOOL_NAME, // 不能退出 plan mode
+    FILE_EDIT_TOOL_NAME,      // 不能改文件
+    FILE_WRITE_TOOL_NAME,     // 不能写文件
+    NOTEBOOK_EDIT_TOOL_NAME,  // 不能改 Notebook
+  ],
+  source: 'built-in',
+  tools: EXPLORE_AGENT.tools, // 复用 Explore 的工具池
+  baseDir: 'built-in',
+  model: 'inherit',           // 跟随主会话模型
+  omitClaudeMd: true,         // 不注入 CLAUDE.md，省 token
+  getSystemPrompt: () => getPlanV2SystemPrompt(),
+}
+```
+
+### 它做什么
+
+一个**只读的架构规划子代理**。模型这样调用：
+
+```ts
+Agent({
+  subagent_type: "Plan",
+  prompt: "设计把单体拆成微服务的方案...",
+})
+```
+
+流程固定为四步：
+
+1. 理解需求；
+2. 用 Glob / Grep / Read / Bash（只读）探索代码库；
+3. 设计实现方案并权衡架构取舍；
+4. 输出分步计划，结尾必须给出 3–5 个关键文件：
+
+```text
+### Critical Files for Implementation
+- path/to/file1.ts
+- path/to/file2.ts
+- path/to/file3.ts
+```
+
+### 工具权限
+
+`tools` 没有显式列表（`EXPLORE_AGENT.tools` 是 `undefined`），所以默认是全部工具；再减去 `disallowedTools`：
+
+- **禁止**：Agent、ExitPlanMode、Edit、Write、NotebookEdit
+- **允许**：Read、Glob、Grep、Bash（只读命令）、WebFetch、WebSearch、MCP 等
+
+系统提示词明确禁止：
+
+- 创建、修改、删除、移动文件；
+- 在 `/tmp` 建临时文件；
+- 用 `>`、`>>`、`|`、heredoc 写文件；
+- 任何改变系统状态的命令。
+
+Bash 只允许 `ls`、`git status/log/diff`、`find`、`cat`、`head`、`tail` 这类只读操作。
+
+### 注册条件
+
+`src/tools/AgentTool/builtInAgents.ts:72-74`：
+
+```ts
+if (areExplorePlanAgentsEnabled()) {
+  agents.push(EXPLORE_AGENT, PLAN_AGENT)
+}
+```
+
+`areExplorePlanAgentsEnabled()` 对非 ant 用户默认返回 `true`；ant 内部构建受 GrowthBook flag 控制。
+
+### 三个容易混淆的概念
+
+| 名称 | 是什么 |
+|---|---|
+| `PLAN_AGENT` / `subagent_type: "Plan"` | 一个**只读规划子代理** |
+| `permissionMode: "plan"` | 一种**会话权限模式**：先规划、动手前要审批 |
+| `EnterPlanModeTool` / `ExitPlanModeTool` | 切换 plan mode 的**工具** |
+
+三者相关但不同：Plan 子代理是“帮你写方案的人”；plan mode 是“主会话先别改文件”的权限状态。
+
+### 和 Explore 的关系
+
+`PLAN_AGENT` 直接复用 `EXPLORE_AGENT.tools`，系统提示结构也一致（都强制只读），区别在角色和输出：
+
+| | Explore | Plan |
+|---|---|---|
+| 目标 | 快速找到文件和答案 | 产出实现方案 |
+| 模型 | 外部构建默认 `haiku` | `inherit`（跟随主会话） |
+| 输出 | 调研结论 | 分步计划 + 关键文件清单 |
+| 工具池 | 全部减编辑类 | 同 Explore |
+
+可以把它理解为：**“Explore 的只读工具集 + 架构师提示词 + 固定输出格式”的内置 Agent 定义**。
