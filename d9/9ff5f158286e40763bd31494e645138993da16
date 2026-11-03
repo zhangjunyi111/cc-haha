@@ -1,0 +1,22 @@
+deepagents-internals.md
+  s_bfbb1f85e4242f::t_c84bbff64adeb1 1-289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "5.30.1",
+  "base_commit_sha": "d99ff5f158286e40763bd31494e645138993da16",
+  "prompts": {},
+  "sessions": {
+    "s_bfbb1f85e4242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2e0197fe-b318-49a0-a3c6-913c8539da33",
+        "model": "unknown"
+      },
+      "human_author": "junyi <zhangjunyi31@h-partners.com>",
+      "total_additions": 0,
+      "total_deletions": 0,
+      "overridden_lines": 0
+    }
+  }
+}
