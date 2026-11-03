@@ -1,0 +1,24 @@
+cc-haha-analysis.md
+  s_bfbb1f85e4242f::t_90d965a3f2a17b 63-64
+cc-haha-kernel-analysis.md
+  s_bfbb1f85e4242f::t_c9c47e2751ee67 713-1094
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "5.30.1",
+  "base_commit_sha": "bc3ab38df59b51881a5670732c615c9e195b02c0",
+  "prompts": {},
+  "sessions": {
+    "s_bfbb1f85e4242f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2e0197fe-b318-49a0-a3c6-913c8539da33",
+        "model": "unknown"
+      },
+      "human_author": "junyi <zhangjunyi31@h-partners.com>",
+      "total_additions": 0,
+      "total_deletions": 0,
+      "overridden_lines": 0
+    }
+  }
+}
