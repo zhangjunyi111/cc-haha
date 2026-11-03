@@ -282,6 +282,109 @@ libs/deepagents/deepagents/middleware/filesystem.py:1608   文件工具名
 
 ---
 
+## 11. 它会不会主动发现目录下的 agent / skill？
+
+结论先给：
+
+> **LangChain 基础库不发现任何东西；Deep Agents 只在你给定的 source 里发现 skill，agent 永远靠参数传入。**
+
+### 11.1 基础 LangChain：确实什么都不扫
+
+`langchain.agents.create_agent()` 只接收：
+
+```python
+create_agent(model, tools=..., middleware=..., system_prompt=...)
+```
+
+没有 `.claude/agents`、`skills/`、`AGENTS.md` 这些概念，也不会去读当前项目目录。**agent 和 skill 都必须由调用方显式传入。**
+
+### 11.2 Deep Agents：agent 不扫，skill 扫但只扫你给的 source
+
+#### Agent / Subagent：完全没有目录发现
+
+`create_deep_agent(subagents=...)` 的三种来源：
+
+```python
+subagents = [
+    SubAgent(...),          # 声明式 spec
+    CompiledSubAgent(...),  # 调用方已构建好的 runnable
+    AsyncSubAgent(...),     # 远程 LangSmith
+]
+```
+
+再加上一个默认的 `general-purpose`（可关闭）。
+
+**没有** `~/.claude/agents/*.md` 扫描，也**没有**从项目目录读取 agent 定义。Claude Code 那套“把 Markdown 放进 `~/.claude/agents/` 就自动出现”的机制，Deep Agents 没有。
+
+#### Skills：有主动扫描，但扫描范围由 `skills=` 决定
+
+`create_deep_agent(skills=[...])` 的文档：
+
+> `skills`: List of skill source paths (e.g., `["/skills/user/", "/skills/project/"]`).
+> Paths must be specified using POSIX conventions and are relative to the backend's root.
+
+`SkillsMiddleware` 对每个 source 做的是：
+
+```python
+ls_result = backend.ls(source_path)
+# 找所有包含 SKILL.md 的子目录
+for skill_dir in ...:
+    skill_md_path = str(skill_dir / "SKILL.md")
+responses = backend.download_files(paths_to_download)
+# 解析 frontmatter → SkillMetadata
+```
+
+所以：
+
+- **会主动列目录、找 `SKILL.md`、解析 frontmatter**；
+- 但只在 `skills=` 给出的路径里；
+- **不会**自动去 `~/.claude/skills` 或 `<repo>/.claude/skills`，除非你把这些路径写进去；
+- “目录”是 backend 的相对路径：`StateBackend` 是虚拟 FS，`FilesystemBackend` 才映射到真实磁盘的 `root_dir`。
+
+`skills.py:60-71` 里出现 `~/.claude/skills`、`/repo/.claude/skills`，只是文档示例，展示可以把 Claude 的目录作为 source 传进去，不是默认行为。
+
+#### Memory：同样只读显式路径
+
+```python
+memory=["/memory/AGENTS.md", "~/.deepagents/AGENTS.md"]
+```
+
+`MemoryMiddleware` 直接 `backend.download_files(sources)`，不扫描目录。
+
+### 11.3 “只能通过中间件注入” 需要修正
+
+更准确的说法：
+
+| 环节 | 谁负责 |
+|---|---|
+| 决定去哪找 | **调用方**：`skills=[...]` / `subagents=[...]` / `memory=[...]` |
+| 扫描 source 下的 `SKILL.md` | **`SkillsMiddleware`**（主动 `ls` + `download`） |
+| 把 skill 目录摘要注入 system prompt | **`SkillsMiddleware`** |
+| 把技能正文在调用时追加到对话 | **`SkillsMiddleware`** 的调用路径 |
+| 提供 `task` 工具并路由到子 Agent | **`SubAgentMiddleware`** |
+
+所以不是“中间件被动注入”，而是：
+
+> **发现由显式 source 驱动，扫描和注入由中间件完成。**
+
+### 11.4 和 Claude Code / cc-haha 的对比
+
+| | Claude Code / cc-haha | Deep Agents |
+|---|---|---|
+| agent 发现 | `~/.claude/agents`、项目 `.claude/agents`、插件、内置 | 仅 `subagents=` 参数 + 默认 general-purpose |
+| skill 发现 | 约定目录自动扫描：managed / user / project / `--add-dir` / `.agents/skills` / legacy commands | 仅 `skills=` 给出的 source 路径 |
+| 嵌套/动态发现 | 有：monorepo 嵌套目录、`paths:` 条件激活 | 无 |
+| 同名优先级 | 完整规则（`.claude` > `.agents`，scope 顺序） | 简单：后一个 source 覆盖前一个 |
+| 注入方式 | `skill_listing` attachment + system-reminder | 中间件写入 system prompt / state |
+| 正文加载 | 调用时展开 `SKILL.md` | 调用时 pin `SKILL.md` 正文 |
+
+### 11.5 一句话总结
+
+- **agent：对。** LangChain 和 Deep Agents 都不会主动去项目目录里发现 agent 定义。
+- **skill：不完全对。** Deep Agents 会主动扫描目录，但只扫描显式传给 `skills=` 的 source；它没有 Claude Code 那种“约定目录自动发现”。
+
+---
+
 ## Sources
 
 - [Deep Agents Architecture (GitHub)](https://github.com/langchain-ai/deepagents/blob/afff4f88/libs/ARCHITECTURE.md?plain=1)
